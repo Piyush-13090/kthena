@@ -3355,3 +3355,148 @@ func TestStore_SessionBoostQueue_ConcurrentPodUpdates(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestStore_SessionBoostQueue_UnchangedMetricsAndModelsDoNotWake verifies that
+// when pod metrics and loaded models are unchanged during a scrape or update,
+// no spurious wake signals or evaluations are triggered.
+func TestStore_SessionBoostQueue_UnchangedMetricsAndModelsDoNotWake(t *testing.T) {
+	metricsCalled := 0
+	inspector := &fakePodRuntimeInspector{
+		modelsFn: func(engine string, pod *corev1.Pod, port uint32) ([]string, error) {
+			return []string{"stable-model"}, nil
+		},
+		metricsFn: func(engine string, pod *corev1.Pod, port uint32, prev map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+			metricsCalled++
+			return map[string]float64{
+				utils.RequestWaitingNum: 5.0, // busy
+				utils.RequestRunningNum: 2.0,
+				utils.KVCacheUsage:      0.4,
+			}, nil
+		},
+	}
+
+	s := newStore(inspector)
+	s.fairnessQueueConfig.SessionBoostEnabled = true
+	s.fairnessQueueConfig.InflightPerPod = 16
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s.Run(ctx)
+
+	ms := &aiv1alpha1.ModelServer{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "ms-stable"},
+		Spec: aiv1alpha1.ModelServerSpec{
+			Model:           ptr("stable-model"),
+			InferenceEngine: "vLLM",
+		},
+	}
+	assert.NoError(t, s.AddOrUpdateModelServer(ms, nil))
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pod-stable"},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.1"},
+	}
+	assert.NoError(t, s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms}))
+
+	podInfo := s.GetPodInfo(utils.GetNamespaceName(pod))
+	assert.NotNil(t, podInfo)
+
+	// Direct check: second update with identical metrics should return changed = false
+	changed := s.updatePodMetricsWithNotify(podInfo, false)
+	assert.False(t, changed, "updatePodMetrics should return false when metrics are unchanged")
+
+	// Direct check: second update with identical models should return changed = false
+	modelsChanged := s.updatePodModelsWithNotify(podInfo, false)
+	assert.False(t, modelsChanged, "updatePodModels should return false when models are unchanged")
+
+	// Verify updatePodMetrics and updatePodModels wrappers execute without error
+	s.updatePodMetrics(podInfo)
+	s.updatePodModels(podInfo)
+
+	// Test UpdateModels directly
+	assert.False(t, podInfo.UpdateModels([]string{"stable-model"}), "UpdateModels should return false for identical set")
+	assert.True(t, podInfo.UpdateModels([]string{"stable-model", "lora-adapter-1"}), "UpdateModels should return true for changed set")
+
+	// Test MatchesModelAndGetWaitingNum
+	matches, waiting := podInfo.MatchesModelAndGetWaitingNum("stable-model")
+	assert.True(t, matches)
+	assert.Equal(t, 5.0, waiting)
+
+	matches, _ = podInfo.MatchesModelAndGetWaitingNum("non-existent-model")
+	assert.False(t, matches)
+}
+
+// TestStore_ScrapeCycle_CoalescesNotificationsAcrossPods verifies that multiple pods
+// updating in a scrape cycle wake the model queue cleanly and admit waiting requests.
+func TestStore_ScrapeCycle_CoalescesNotificationsAcrossPods(t *testing.T) {
+	var mu sync.Mutex
+	waitingCount := 5.0
+
+	inspector := &fakePodRuntimeInspector{
+		modelsFn: func(engine string, pod *corev1.Pod, port uint32) ([]string, error) {
+			return []string{"batch-model"}, nil
+		},
+		metricsFn: func(engine string, pod *corev1.Pod, port uint32, prev map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+			mu.Lock()
+			w := waitingCount
+			mu.Unlock()
+			return map[string]float64{
+				utils.RequestWaitingNum: w,
+			}, nil
+		},
+	}
+
+	s := newStore(inspector)
+	s.fairnessQueueConfig.SessionBoostEnabled = true
+	s.fairnessQueueConfig.InflightPerPod = 16
+	s.metricsScrapeInterval = 50 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s.Run(ctx)
+
+	ms := &aiv1alpha1.ModelServer{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "ms-batch"},
+		Spec: aiv1alpha1.ModelServerSpec{
+			Model:           ptr("batch-model"),
+			InferenceEngine: "vLLM",
+		},
+	}
+	assert.NoError(t, s.AddOrUpdateModelServer(ms, nil))
+
+	// Add 5 busy pods
+	for i := 0; i < 5; i++ {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: fmt.Sprintf("pod-%d", i)},
+			Status:     corev1.PodStatus{PodIP: fmt.Sprintf("10.0.0.%d", i+1)},
+		}
+		assert.NoError(t, s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms}))
+	}
+
+	req := &Request{
+		UserID:      "user-batch",
+		ModelName:   "batch-model",
+		RequestTime: time.Now(),
+		NotifyChan:  make(chan struct{}),
+	}
+	assert.NoError(t, s.Enqueue(req))
+
+	// Verify request is initially blocked
+	select {
+	case <-req.NotifyChan:
+		t.Fatal("req should be blocked while all pods are busy")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Capacity becomes available across all pods
+	mu.Lock()
+	waitingCount = 0.0
+	mu.Unlock()
+
+	// Wait for scrape cycle to detect change and wake queue
+	select {
+	case <-req.NotifyChan:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout: req should be admitted after scrape cycle detects capacity")
+	}
+}
